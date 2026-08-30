@@ -960,84 +960,68 @@ class JudgehostController extends AbstractFOSRestController
             $runResult = $resultsRemap[$runResult];
         }
 
-        $this->em->wrapInTransaction(function () use (
-            $judgeTaskId,
-            $runTime,
-            $startTime,
-            $endTime,
-            $runResult,
-            $outputSystem,
-            $outputError,
-            $outputDiff,
-            $outputRun,
-            $teamMessage,
-            $metadata,
-            $testcasedir,
-            $compareMeta,
-            $score,
-            $pass
-        ): void {
-            $judgingRun = $this->em->getRepository(JudgingRun::class)->findOneBy(
-                ['judgetaskid' => $judgeTaskId]);
-            if ($judgingRun === null) {
+        $judgingRun = $this->em->getRepository(JudgingRun::class)->findOneBy(
+            ['judgetaskid' => $judgeTaskId]);
+        if ($judgingRun === null) {
+            throw new BadRequestHttpException(
+                'Inconsistent data, no judging run known with judgetaskid = ' . $judgeTaskId . '.');
+        }
+        $judgingRunOutput = $judgingRun->getOutput();
+        if ($judgingRunOutput === null) {
+            $judgingRunOutput = new JudgingRunOutput();
+            $judgingRun->setOutput($judgingRunOutput);
+        }
+        $judgingRun
+            ->setRunresult($runResult)
+            ->setRuntime((float)$runTime)
+            ->setStarttime($startTime)
+            ->setEndtime($endTime)
+            ->setTestcasedir($testcasedir)
+            ->setPass($pass);
+        $judgingRunOutput
+            ->setOutputRun(base64_decode($outputRun))
+            ->setOutputDiff(base64_decode($outputDiff))
+            ->setOutputError(base64_decode($outputError))
+            ->setOutputSystem(base64_decode($outputSystem))
+            ->setMetadata(base64_decode($metadata));
+
+        if ($compareMeta) {
+            $judgingRunOutput->setValidatorMetadata(base64_decode($compareMeta));
+        }
+
+        if ($teamMessage) {
+            $judgingRunOutput->setTeamMessage(base64_decode($teamMessage));
+        }
+
+        if ($score) {
+            $decodedScore = trim(base64_decode($score));
+            if (!is_numeric($decodedScore)) {
                 throw new BadRequestHttpException(
-                    'Inconsistent data, no judging run known with judgetaskid = ' . $judgeTaskId . '.');
+                    sprintf("Invalid score '%s' for judgetask %d: not a numeric value.", $decodedScore, $judgeTaskId));
             }
-            $judgingRunOutput = $judgingRun->getOutput();
-            if ($judgingRunOutput === null) {
-                $judgingRunOutput = new JudgingRunOutput();
-                $judgingRun->setOutput($judgingRunOutput);
+            if (bccomp($decodedScore, '0', ScoreboardService::SCALE) < 0) {
+                throw new BadRequestHttpException(
+                    sprintf("Invalid score '%s' for judgetask %d: must not be negative.", $decodedScore, $judgeTaskId));
             }
-            $judgingRun
-                ->setRunresult($runResult)
-                ->setRuntime((float)$runTime)
-                ->setStarttime($startTime)
-                ->setEndtime($endTime)
-                ->setTestcasedir($testcasedir)
-                ->setPass($pass);
-            $judgingRunOutput
-                ->setOutputRun(base64_decode($outputRun))
-                ->setOutputDiff(base64_decode($outputDiff))
-                ->setOutputError(base64_decode($outputError))
-                ->setOutputSystem(base64_decode($outputSystem))
-                ->setMetadata(base64_decode($metadata));
+            $problem = $judgingRun->getJudging()->getSubmission()->getProblem();
+            if (!$problem->isScoringProblem()) {
+                throw new BadRequestHttpException(
+                    sprintf("Received score for judgetask %d, but problem '%s' is not a scoring problem.",
+                        $judgeTaskId, $problem->getExternalid()));
+            }
+            $judgingRun->setScore($decodedScore);
+        }
 
-            if ($compareMeta) {
-                $judgingRunOutput->setValidatorMetadata(base64_decode($compareMeta));
-            }
+        $judging = $judgingRun->getJudging();
+        // The run result has a single writer, so a plain flush is safe for it;
+        // maybeUpdateActiveJudging() handles its own atomicity.
+        $this->em->flush();
+        $this->maybeUpdateActiveJudging($judging);
 
-            if ($teamMessage) {
-                $judgingRunOutput->setTeamMessage(base64_decode($teamMessage));
-            }
-
-            if ($score) {
-                $decodedScore = trim(base64_decode($score));
-                if (!is_numeric($decodedScore)) {
-                    throw new BadRequestHttpException(
-                        sprintf("Invalid score '%s' for judgetask %d: not a numeric value.", $decodedScore, $judgeTaskId));
-                }
-                if (bccomp($decodedScore, '0', ScoreboardService::SCALE) < 0) {
-                    throw new BadRequestHttpException(
-                        sprintf("Invalid score '%s' for judgetask %d: must not be negative.", $decodedScore, $judgeTaskId));
-                }
-                $problem = $judgingRun->getJudging()->getSubmission()->getProblem();
-                if (!$problem->isScoringProblem()) {
-                    throw new BadRequestHttpException(
-                        sprintf("Received score for judgetask %d, but problem '%s' is not a scoring problem.",
-                            $judgeTaskId, $problem->getExternalid()));
-                }
-                $judgingRun->setScore($decodedScore);
-            }
-
-            $judging = $judgingRun->getJudging();
-            $this->maybeUpdateActiveJudging($judging);
-            $this->em->flush();
-
-            if ($judging->getValid()) {
-                $this->eventLogService->log('judging_run', $judgingRun->getRunid(),
-                                            EventLogService::ACTION_CREATE, $judging->getContest()->getCid());
-            }
-        });
+        if ($judging->getValid()) {
+            $this->eventLogService->log('judging_run', $judgingRun->getRunid(),
+                                        EventLogService::ACTION_CREATE, $judging->getContest()->getCid());
+        }
 
         // Reload the judging, as EventLogService::log will clear the entity manager.
         // For the judging, also load in the submission and some of its relations.
@@ -1193,81 +1177,116 @@ class JudgehostController extends AbstractFOSRestController
         return $judging->getResult() === null || $judging->getJudgeCompletely() || $lazyEval === DOMJudgeService::EVAL_FULL;
     }
 
+    /**
+     * Apply a finished rejudging to its submission, when the rejudging auto-applies.
+     *
+     * No transaction: each decision is made in the WHERE clause of the statement that acts on
+     * it, so there is no earlier read that a concurrent judgehost could invalidate.
+     */
     private function maybeUpdateActiveJudging(Judging $judging): void
     {
-        if ($judging->getRejudging() !== null) {
-            $rejudging = $judging->getRejudging();
-            if ($rejudging->getAutoApply()) {
-                $judging->getSubmission()->setRejudging(null);
-                foreach ($judging->getSubmission()->getJudgings() as $j) {
-                    $j->setValid(false);
-                }
-                $judging->setValid(true);
-
-                // Check whether we are completely done with this rejudging.
-                if ($rejudging->getEndtime() === null && $this->rejudgingService->calculateTodo($rejudging)['todo'] == 0) {
-                    $rejudging->setEndtime(Utils::now());
-                    $rejudging->setFinishUser(null);
-                    $this->em->flush();
-                }
-            }
-
-            if ($rejudging->getRepeat() > 1 && $rejudging->getEndtime() === null
-                    && $this->rejudgingService->calculateTodo($rejudging)['todo'] == 0) {
-                $numberOfRepetitions = $this->em->createQueryBuilder()
-                    ->from(Rejudging::class, 'r')
-                    ->select('COUNT(r.rejudgingid) AS cnt')
-                    ->andWhere('r.repeatedRejudging = :repeat_rejudgingid')
-                    ->setParameter('repeat_rejudgingid', $rejudging->getRepeatedRejudging()->getRejudgingid())
-                    ->getQuery()
-                    ->getSingleScalarResult();
-                // Only "cancel" the rejudging if it's not the last.
-                if ($numberOfRepetitions < $rejudging->getRepeat()) {
-                    $rejudgingid = $rejudging->getRejudgingid();
-                    $numUpdated = $this->em->getConnection()->executeStatement(
-                        'UPDATE rejudging
-                        SET endtime = :endtime, valid = 0
-                        WHERE rejudgingid = :rejudgingid
-                          AND endtime IS NULL',
-                        [
-                            'endtime' => Utils::now(),
-                            'rejudgingid' => $rejudgingid,
-                        ]
-                    );
-                    $this->em->flush();
-                    if ($numUpdated == 0) {
-                        // Due to parallel judging some other judgehost did the same calculation just now and beat us
-                        // to it.
-                        return;
-                    }
-
-                    // Reset association before creating the new rejudging.
-                    $this->em->getConnection()->executeStatement(
-                        'UPDATE submission
-                            SET rejudgingid = NULL
-                            WHERE rejudgingid = :rejudgingid',
-                        ['rejudgingid' => $rejudgingid]);
-                    $this->em->flush();
-
-                    $skipped = [];
-                    /** @var Judging[] $judgings */
-                    $judgings = $this->em->createQueryBuilder()
-                        ->from(Judging::class, 'j')
-                        ->leftJoin('j.submission', 's')
-                        ->leftJoin('s.rejudging', 'r')
-                        ->leftJoin('s.team', 't')
-                        ->select('j', 's', 'r', 't')
-                        ->andWhere('j.rejudging = :rejudgingid')
-                        ->setParameter('rejudgingid', $rejudgingid)
-                        ->getQuery()
-                        ->setHint(Query::HINT_REFRESH, true)
-                        ->getResult();
-                    // TODO: Pick up priority from previous judgings?
-                    $this->rejudgingService->createRejudging($rejudging->getReason(), JudgeTask::PRIORITY_DEFAULT, $judgings,
-                        false, $rejudging->getRepeat(), 0, $rejudging->getRepeatedRejudging(), $skipped);
-                }
-            }
+        $rejudging = $judging->getRejudging();
+        if ($rejudging === null) {
+            return;
         }
+
+        $rejudgingid = $rejudging->getRejudgingid();
+        $connection = $this->em->getConnection();
+
+        // Release the submission from the rejudging and make this judging its valid one. The
+        // join on the submission's rejudging skips a submission released in the meantime, for
+        // example by cancelling the rejudging.
+        $applied = $connection->executeStatement(
+            'UPDATE submission s
+                INNER JOIN rejudging r ON r.rejudgingid = s.rejudgingid
+                INNER JOIN judging j ON j.submitid = s.submitid
+                SET s.rejudgingid = NULL, j.valid = (j.judgingid = :judgingid)
+              WHERE s.submitid = :submitid
+                AND r.rejudgingid = :rejudgingid
+                AND r.auto_apply = 1',
+            [
+                'judgingid' => $judging->getJudgingid(),
+                'submitid' => $judging->getSubmissionId(),
+                'rejudgingid' => $rejudgingid,
+            ]
+        );
+        if ($applied > 0) {
+            // Callers read getValid() right after this. Setting it rather than refreshing the
+            // judging keeps the changes they have not flushed yet.
+            $judging->setValid(true);
+        }
+
+        // Finish the rejudging once none of its judgings is left to do. Every judgehost gets
+        // here after writing its own judging's end time, so the last one sees them all done.
+        $connection->executeStatement(
+            'UPDATE rejudging SET endtime = :endtime, userid_finish = NULL
+              WHERE rejudgingid = :rejudgingid
+                AND auto_apply = 1
+                AND endtime IS NULL
+                AND NOT EXISTS (SELECT 1 FROM judging WHERE rejudgingid = :rejudgingid AND endtime IS NULL)',
+            [
+                'endtime' => Utils::now(),
+                'rejudgingid' => $rejudgingid,
+            ]
+        );
+
+        if ($rejudging->getRepeat() <= 1) {
+            return;
+        }
+
+        $numberOfRepetitions = $this->em->createQueryBuilder()
+            ->from(Rejudging::class, 'r')
+            ->select('COUNT(r.rejudgingid) AS cnt')
+            ->andWhere('r.repeatedRejudging = :repeat_rejudgingid')
+            ->setParameter('repeat_rejudgingid', $rejudging->getRepeatedRejudging()->getRejudgingid())
+            ->getQuery()
+            ->getSingleScalarResult();
+        // Only "cancel" the rejudging if it's not the last.
+        if ($numberOfRepetitions >= $rejudging->getRepeat()) {
+            return;
+        }
+
+        // Claim the next repetition. An auto-applying rejudging was finished just above, so this
+        // only passes for one that does not auto-apply, as before.
+        $numUpdated = $connection->executeStatement(
+            'UPDATE rejudging SET endtime = :endtime, valid = 0
+              WHERE rejudgingid = :rejudgingid
+                AND endtime IS NULL
+                AND NOT EXISTS (SELECT 1 FROM judging WHERE rejudgingid = :rejudgingid AND endtime IS NULL)',
+            [
+                'endtime' => Utils::now(),
+                'rejudgingid' => $rejudgingid,
+            ]
+        );
+        if ($numUpdated == 0) {
+            // Not done yet, or due to parallel judging some other judgehost did the same
+            // calculation just now and beat us to it.
+            return;
+        }
+
+        // Reset association before creating the new rejudging.
+        $connection->executeStatement(
+            'UPDATE submission
+                SET rejudgingid = NULL
+                WHERE rejudgingid = :rejudgingid',
+            ['rejudgingid' => $rejudgingid]);
+
+        $skipped = [];
+        /** @var Judging[] $judgings */
+        $judgings = $this->em->createQueryBuilder()
+            ->from(Judging::class, 'j')
+            ->leftJoin('j.submission', 's')
+            ->leftJoin('s.rejudging', 'r')
+            ->leftJoin('s.team', 't')
+            ->select('j', 's', 'r', 't')
+            ->andWhere('j.rejudging = :rejudgingid')
+            ->setParameter('rejudgingid', $rejudgingid)
+            ->getQuery()
+            ->setHint(Query::HINT_REFRESH, true)
+            ->getResult();
+        // TODO: Pick up priority from previous judgings?
+        $this->rejudgingService->createRejudging($rejudging->getReason(), JudgeTask::PRIORITY_DEFAULT, $judgings,
+            false, $rejudging->getRepeat(), 0, $rejudging->getRepeatedRejudging(), $skipped);
     }
 
     /**
